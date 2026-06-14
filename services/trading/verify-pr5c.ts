@@ -113,7 +113,7 @@ async function runTests() {
   const testUser = 'test-user-123';
 
   // Helper to create basic JSON POST request
-  function createProxyRequest(payload: any = { method: 'POST', path: '/v1/orders', body: { orderId: 'test-1' } }) {
+  function createProxyRequest(payload: any = { method: 'POST', path: '/api/v1/orders', body: { orderId: 'test-1' } }) {
     return new NextRequest('http://localhost:3000/api/toss-proxy', {
       method: 'POST',
       headers: {
@@ -244,13 +244,14 @@ async function runTests() {
     console.log(`Body:`, resBody);
 
     const isRoutedCorrectly = res.status === 200 && resBody.message.includes('Forwarded to Toss API');
+    const headers = fetchCallArgs !== null ? (fetchCallArgs as any).options.headers : {};
     const isFetchCalledWithCredentials = fetchCallArgs !== null &&
-      (fetchCallArgs as any).options.headers['authorization'] === 'Bearer mocked-oauth-token';
+      (headers['authorization'] === 'Bearer mocked-oauth-token' || headers['Authorization'] === 'Bearer mocked-oauth-token');
 
     if (isRoutedCorrectly && isFetchCalledWithCredentials) {
       console.log('Test D: ✅ PASS');
     } else {
-      console.log('Test D: ❌ FAIL');
+      console.log('Test D: ❌ FAIL', { isRoutedCorrectly, isFetchCalledWithCredentials, fetchCallArgs });
       process.exit(1);
     }
   }

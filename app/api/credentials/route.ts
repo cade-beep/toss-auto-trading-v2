@@ -65,8 +65,56 @@ export async function POST(request: NextRequest) {
     const body = await request.json();
     const { apiKey, secretKey, accountId } = body;
 
-    if (!apiKey || !secretKey || !accountId) {
-      return NextResponse.json({ error: 'Validation Error: API Key, Secret Key, and Account ID are all required.' }, { status: 400 });
+    if (!apiKey || !secretKey) {
+      return NextResponse.json({ error: 'Validation Error: API Key and Secret Key are required.' }, { status: 400 });
+    }
+
+    let finalAccountId = accountId || '';
+    if (!finalAccountId) {
+      // Automatic Account Discovery
+      const tossApiUrl = process.env.TOSS_API_URL;
+      if (!tossApiUrl) {
+        return NextResponse.json({ error: 'ConfigurationError: TOSS_API_URL environment variable is not configured.' }, { status: 500 });
+      }
+
+      try {
+        const { tossTokenCache } = await import('../../../services/trading/toss-token-cache');
+        const accessToken = await tossTokenCache.getToken(apiKey, secretKey);
+        
+        const accountsRes = await fetch(`${tossApiUrl}/api/v1/accounts`, {
+          method: 'GET',
+          headers: {
+            'Authorization': `Bearer ${accessToken}`
+          }
+        });
+
+        if (!accountsRes.ok) {
+          const errBody = await accountsRes.json().catch(() => ({}));
+          throw new Error(errBody.error?.message || errBody.error || `HTTP ${accountsRes.status}`);
+        }
+
+        const accountsData = await accountsRes.json();
+        interface BrokerageAccount {
+          accountType: string;
+          accountSeq: number;
+        }
+        const accountsList = (accountsData.result || []) as BrokerageAccount[];
+        const brokerageAccount = accountsList.find((acc) => acc.accountType === 'BROKERAGE');
+
+        if (!brokerageAccount) {
+          return NextResponse.json({ error: 'ConfigurationError: No brokerage account found during discovery.' }, { status: 404 });
+        }
+
+        const discoveredSeq = brokerageAccount.accountSeq;
+        if (discoveredSeq === undefined || discoveredSeq === null) {
+          return NextResponse.json({ error: 'ConfigurationError: Discovered brokerage account is missing accountSeq.' }, { status: 500 });
+        }
+
+        finalAccountId = String(discoveredSeq);
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        return NextResponse.json({ error: `SystemError: Automatic account discovery failed: ${errorMsg}` }, { status: 500 });
+      }
     }
 
     const encryptedApiKey = encryptSecret(apiKey);
@@ -79,7 +127,7 @@ export async function POST(request: NextRequest) {
         user_id: user.id,
         encrypted_api_key: encryptedApiKey,
         encrypted_secret_key: encryptedSecretKey,
-        account_id: accountId,
+        account_id: finalAccountId,
         is_simulation: false,
         updated_at: new Date().toISOString()
       });

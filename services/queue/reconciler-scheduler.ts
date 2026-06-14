@@ -207,49 +207,144 @@ export async function sweepInFlightOrders(supabase: SupabaseClient) {
 export async function syncExecutionGap(supabase: SupabaseClient) {
   console.log('[Reconciler] Running Tier 2 Connection Gap Sync...');
 
-  // Fetch the latest execution event from our database to get the timestamp/sequence limit
-  const { data: latestEvent, error } = await supabase
-    .from('broker_execution_events')
-    .select('processed_at')
-    .order('processed_at', { ascending: false })
-    .limit(1)
-    .single();
-
-  if (error && error.code !== 'PGRST116') { // Ignore single-row empty result error
-    console.error('[Reconciler] Failed to fetch latest execution timestamp:', error.message);
-    return;
-  }
-
-  const lastSyncTime = latestEvent ? latestEvent.processed_at : new Date(Date.now() - 3600000).toISOString(); // 1 hour fallback
   const mode = (process.env.NEXT_PUBLIC_TRADING_MODE || 'PAPER') as 'SIMULATION' | 'PAPER' | 'LIVE';
 
   if (mode === 'LIVE') {
-    console.log(`[Reconciler] Fetching executions since ${lastSyncTime} from Toss Proxy...`);
+    console.log('[Reconciler] Running LIVE Tier 2 Connection Gap Sync...');
     try {
-      let baseUrl = process.env.APP_URL || process.env.NEXT_PUBLIC_APP_URL || 'http://127.0.0.1:3000';
-      const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
-      
-      const response = await fetch(`${baseUrl}/api/toss-proxy`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${serviceRoleKey}`,
-          'x-worker-user-id': 'system-gap-sync'
-        },
-        body: JSON.stringify({
-          method: 'GET',
-          path: `/v1/orders/executions?since=${lastSyncTime}`
-        })
-      });
+      // 1. Fetch all API credentials to identify active live trading users
+      const { data: allCreds, error: credsError } = await supabase
+        .from('api_credentials')
+        .select('user_id')
+        .eq('is_simulation', false);
 
-      if (response.ok) {
-        const data = await response.json();
-        console.log(`[Reconciler] Successfully synced execution gap: ${JSON.stringify(data)}`);
-      } else {
-        console.warn(`[Reconciler] Execution gap sync query returned HTTP ${response.status}`);
+      if (credsError || !allCreds) {
+        console.error('[Reconciler] Failed to fetch active live credentials:', credsError?.message);
+        return;
+      }
+
+      for (const cred of allCreds) {
+        const userId = cred.user_id;
+        console.log(`[Reconciler] Reconciling holdings/positions for user ${userId}...`);
+        
+        // Construct user-scoped Supabase client
+        const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
+        const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+        
+        const userClient = createClient(supabaseUrl, serviceRoleKey, {
+          auth: {
+            persistSession: false,
+            autoRefreshToken: false,
+            detectSessionInUrl: false
+          }
+        });
+
+        userClient.auth.getUser = async () => ({
+          data: {
+            user: {
+              id: userId,
+              email: 'worker@toss-auto-trading.internal',
+              role: 'authenticated',
+              aud: 'authenticated',
+              created_at: new Date().toISOString()
+            } as any
+          },
+          error: null
+        });
+
+        userClient.auth.getSession = async () => ({
+          data: {
+            session: {
+              access_token: serviceRoleKey,
+              token_type: 'bearer',
+              expires_in: 3600,
+              refresh_token: '',
+              user: {
+                id: userId,
+                role: 'authenticated',
+                aud: 'authenticated'
+              } as any
+            }
+          },
+          error: null
+        });
+
+        const service = TradingServiceFactory.getService('LIVE', userClient);
+        
+        // 2. Fetch live holdings
+        let liveHoldings;
+        try {
+          liveHoldings = await service.getPositions();
+        } catch (fetchErr: any) {
+          console.warn(`[Reconciler] Failed to fetch live holdings for user ${userId}:`, fetchErr.message);
+          continue;
+        }
+
+        // 3. Fetch live balance (buying power)
+        let liveBalance;
+        try {
+          liveBalance = await service.getAccountBalance();
+        } catch (fetchErr: any) {
+          console.warn(`[Reconciler] Failed to fetch live balance for user ${userId}:`, fetchErr.message);
+          continue;
+        }
+
+        // 4. Update the local portfolio_state with the true cash balance
+        const { error: balanceUpdateError } = await supabase
+          .from('portfolio_state')
+          .upsert({
+            user_id: userId,
+            cash_balance: liveBalance.cashBalance,
+            updated_at: new Date().toISOString()
+          });
+
+        if (balanceUpdateError) {
+          console.error(`[Reconciler] Failed to sync cash balance for user ${userId}:`, balanceUpdateError.message);
+        }
+
+        // 5. Update local positions (zero out local positions that aren't in live holdings)
+        const liveSymbols = new Set(liveHoldings.map(h => h.symbol));
+        
+        // Fetch current local positions
+        const { data: localPositions } = await supabase
+          .from('position_state')
+          .select('symbol')
+          .eq('user_id', userId);
+
+        if (localPositions) {
+          for (const localPos of localPositions) {
+            if (!liveSymbols.has(localPos.symbol)) {
+              // Zero out local position that does not exist in broker holdings
+              await supabase
+                .from('position_state')
+                .update({ qty: 0, updated_at: new Date().toISOString() })
+                .eq('user_id', userId)
+                .eq('symbol', localPos.symbol);
+            }
+          }
+        }
+
+        // Upsert active live holdings into local position_state
+        for (const position of liveHoldings) {
+          const { error: posUpdateError } = await supabase
+            .from('position_state')
+            .upsert({
+              user_id: userId,
+              symbol: position.symbol,
+              qty: position.qty,
+              avg_buy_price: position.avgBuyPrice,
+              updated_at: new Date().toISOString()
+            });
+
+          if (posUpdateError) {
+            console.error(`[Reconciler] Failed to sync position ${position.symbol} for user ${userId}:`, posUpdateError.message);
+          }
+        }
+
+        console.log(`[Reconciler] User ${userId} reconciliation finished. Cash synced: ${liveBalance.cashBalance}. Holdings synced: ${liveHoldings.length}.`);
       }
     } catch (err: any) {
-      console.error('[Reconciler] Failed execution gap sync fetch:', err.message);
+      console.error('[Reconciler] Error in connection gap sync execution:', err.message);
     }
   } else {
     // Simulated broker fetch: In a live environment, this would call GET /executions?since=lastSyncTime
