@@ -256,7 +256,7 @@ export class TossTradingService implements TradingService {
       }
       return price;
     } catch (err: any) {
-      console.error(`[TossTradingService] Failed to fetch live price for ${symbol}:`, err.message);
+      console.error('[TossTradingService] Failed to fetch live price for %s: %s', symbol, err instanceof Error ? err.message : String(err));
       throw err;
     }
   }
